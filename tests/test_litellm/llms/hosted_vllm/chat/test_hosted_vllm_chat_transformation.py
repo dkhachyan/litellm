@@ -179,10 +179,10 @@ def test_hosted_vllm_supports_thinking():
     assert optional_params["reasoning_effort"] == "low"
 
 
-def test_hosted_vllm_thinking_blocks_prepended_to_assistant_content():
+def test_hosted_vllm_thinking_blocks_become_thinking_content_part():
     """
-    Test that thinking_blocks on assistant messages are removed and content
-    stays a string for vLLM compatibility.
+    vLLM ignores `thinking_blocks` / `reasoning_content` on input messages, so the
+    reasoning has to be replayed as a `thinking` content part to reach the prompt.
     """
     config = HostedVLLMChatConfig()
     messages = [
@@ -216,16 +216,17 @@ def test_hosted_vllm_thinking_blocks_prepended_to_assistant_content():
     )
     assistant_msg = transformed["messages"][1]
     assert assistant_msg["role"] == "assistant"
-    assert isinstance(assistant_msg["content"], str)
-    assert assistant_msg["content"] == "Here is my answer."
+    assert assistant_msg["content"] == [
+        {"type": "thinking", "thinking": "Let me reason about this..."},
+        {"type": "text", "text": "Here is my answer."},
+    ]
     assert "thinking_blocks" not in assistant_msg
     assert "reasoning_content" not in assistant_msg
 
 
 def test_hosted_vllm_thinking_blocks_with_list_content():
     """
-    Test thinking_blocks are removed and assistant content list is converted
-    to a string.
+    Multiple thinking blocks collapse into one `thinking` part ahead of the text.
     """
     config = HostedVLLMChatConfig()
     messages = [
@@ -254,9 +255,120 @@ def test_hosted_vllm_thinking_blocks_with_list_content():
         headers={},
     )
     assistant_msg = transformed["messages"][0]
-    assert isinstance(assistant_msg["content"], str)
-    assert assistant_msg["content"] == "Response text"
+    assert assistant_msg["content"] == [
+        {"type": "thinking", "thinking": "Step 1 reasoning\nStep 2 reasoning"},
+        {"type": "text", "text": "Response text"},
+    ]
     assert "thinking_blocks" not in assistant_msg
+
+
+def test_hosted_vllm_reasoning_content_without_thinking_blocks_becomes_content_part():
+    config = HostedVLLMChatConfig()
+    messages = [
+        {
+            "role": "assistant",
+            "content": "The answer is 4.",
+            "reasoning_content": "Two plus two.",
+        },
+    ]
+    transformed = config.transform_request(
+        model="hosted_vllm/llama-3.1-70b-instruct",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+    assistant_msg = transformed["messages"][0]
+    assert assistant_msg["content"] == [
+        {"type": "thinking", "thinking": "Two plus two."},
+        {"type": "text", "text": "The answer is 4."},
+    ]
+    assert "reasoning_content" not in assistant_msg
+
+
+def test_hosted_vllm_redacted_thinking_blocks_produce_no_thinking_part():
+    """
+    vLLM's content schema has no `redacted_thinking` part, and the block carries no
+    readable text, so the assistant message must stay exactly as it was without it.
+    """
+    config = HostedVLLMChatConfig()
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Here is my answer.",
+            "thinking_blocks": [{"type": "redacted_thinking", "data": "encrypted"}],
+        },
+    ]
+    transformed = config.transform_request(
+        model="hosted_vllm/llama-3.1-70b-instruct",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+    assistant_msg = transformed["messages"][0]
+    assert assistant_msg["content"] == "Here is my answer."
+    assert "thinking_blocks" not in assistant_msg
+
+
+def test_hosted_vllm_assistant_without_reasoning_keeps_string_content():
+    config = HostedVLLMChatConfig()
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Response text"}],
+        },
+    ]
+    transformed = config.transform_request(
+        model="hosted_vllm/llama-3.1-70b-instruct",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+    assert transformed["messages"][0]["content"] == "Response text"
+
+
+def test_hosted_vllm_thinking_survives_alongside_tool_use():
+    """
+    A tool-call turn has no text, so the thinking part must not be padded with an
+    empty text part while the tool_use block still becomes a tool call.
+    """
+    config = HostedVLLMChatConfig()
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "get_weather",
+                    "input": {"city": "SF"},
+                }
+            ],
+            "thinking_blocks": [
+                {"type": "thinking", "thinking": "I should look up the weather."}
+            ],
+        },
+    ]
+    transformed = config.transform_request(
+        model="hosted_vllm/llama-3.1-70b-instruct",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+    assistant_msg = transformed["messages"][0]
+    assert assistant_msg["content"] == [
+        {"type": "thinking", "thinking": "I should look up the weather."}
+    ]
+    assert assistant_msg["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "SF"}'},
+        }
+    ]
 
 
 def test_hosted_vllm_assistant_structured_content_is_preserved():

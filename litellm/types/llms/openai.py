@@ -800,18 +800,17 @@ class ChatCompletionUserMessage(OpenAIChatCompletionUserMessage, total=False):
     cache_control: ChatCompletionCachedContent
 
 
+AssistantMessageContentPart: TypeAlias = (
+    ChatCompletionTextObject
+    | ChatCompletionThinkingBlock
+    | ChatCompletionRedactedThinkingBlock
+    | ChatCompletionImageObject
+)
+
+
 class OpenAIChatCompletionAssistantMessage(TypedDict, total=False):
     role: Required[Literal["assistant"]]
-    content: (
-        str
-        | Iterable[
-            ChatCompletionTextObject
-            | ChatCompletionThinkingBlock
-            | ChatCompletionRedactedThinkingBlock
-            | ChatCompletionImageObject
-        ]
-        | None
-    )
+    content: str | Iterable[AssistantMessageContentPart] | None
     name: str | None
     tool_calls: list[ChatCompletionAssistantToolCall] | None
     function_call: ChatCompletionToolCallFunctionChunk | None

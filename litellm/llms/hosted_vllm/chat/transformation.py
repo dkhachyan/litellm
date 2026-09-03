@@ -3,11 +3,12 @@ Translate from OpenAI's `/v1/chat/completions` to VLLM's `/v1/chat/completions`
 """
 
 import json
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Iterable
 from typing import Any, Final, Literal, cast, overload
 
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     _get_image_mime_type_from_url,
+    reasoning_content_from_thinking_blocks,
 )
 from litellm.litellm_core_utils.prompt_templates.factory import _parse_mime_type
 from litellm.litellm_core_utils.reasoning_effort_utils import (
@@ -16,8 +17,12 @@ from litellm.litellm_core_utils.reasoning_effort_utils import (
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import (
     AllMessageValues,
+    AssistantMessageContentPart,
+    ChatCompletionAssistantMessage,
     ChatCompletionAssistantToolCall,
     ChatCompletionFileObject,
+    ChatCompletionTextObject,
+    ChatCompletionThinkingBlock,
     ChatCompletionToolCallFunctionChunk,
     ChatCompletionVideoObject,
     ChatCompletionVideoUrlObject,
@@ -145,6 +150,35 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
             return ChatCompletionVideoObject(type="video_url", video_url=ChatCompletionVideoUrlObject(url=file_data))
         raise ValueError("file_id or file_data is required")
 
+    @staticmethod
+    def _pop_assistant_reasoning_text(message: ChatCompletionAssistantMessage) -> str:
+        """
+        vLLM ignores `reasoning_content` / `thinking_blocks` on input messages, so both are
+        removed here and their text is replayed as a `thinking` content part instead.
+        """
+        reasoning_content: Final = message.pop("reasoning_content", None)
+        thinking_blocks: Final = message.pop("thinking_blocks", None)
+        if isinstance(reasoning_content, str) and reasoning_content:
+            return reasoning_content
+        if thinking_blocks is None:
+            return ""
+        return reasoning_content_from_thinking_blocks(thinking_blocks)
+
+    @staticmethod
+    def _prepend_thinking_content_part(
+        content: str | Iterable[AssistantMessageContentPart] | None, reasoning_text: str
+    ) -> tuple[AssistantMessageContentPart, ...]:
+        """
+        vLLM's chat content schema accepts a `thinking` part; `redacted_thinking` it rejects,
+        which is why only readable text reaches this point.
+        """
+        thinking_part: Final = ChatCompletionThinkingBlock(type="thinking", thinking=reasoning_text)
+        if isinstance(content, str):
+            return (thinking_part, ChatCompletionTextObject(type="text", text=content)) if content else (thinking_part,)
+        if content is None:
+            return (thinking_part,)
+        return (thinking_part, *content)
+
     @overload
     def _transform_messages(
         self, messages: list[AllMessageValues], model: str, is_async: Literal[True]
@@ -164,13 +198,13 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
         """
         Support translating:
         - video files from file_id or file_data to video_url
-        - thinking_blocks and reasoning_content on assistant messages are removed,
-          and content lists are converted to strings for vLLM compatibility
+        - thinking_blocks and reasoning_content on assistant messages are replayed as a
+          `thinking` content part, and content lists are otherwise converted to strings
+          for vLLM compatibility
         """
         for message in messages:
             if message["role"] == "assistant":
-                message.pop("thinking_blocks", None)
-                message.pop("reasoning_content", None)
+                reasoning_text = self._pop_assistant_reasoning_text(message)
                 existing_content = message.get("content")
                 if isinstance(existing_content, list):
                     text_parts = []
@@ -223,6 +257,10 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
                     content_str = "\n".join(text_parts)
                     new_content = content_blocks if has_structured_content else content_str
                     message["content"] = new_content
+                if reasoning_text:
+                    message["content"] = list(
+                        self._prepend_thinking_content_part(message.get("content"), reasoning_text)
+                    )
             elif message["role"] == "user":
                 message_content = message.get("content")
                 if message_content and isinstance(message_content, list):

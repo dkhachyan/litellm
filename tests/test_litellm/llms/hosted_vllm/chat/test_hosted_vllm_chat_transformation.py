@@ -184,10 +184,20 @@ def test_hosted_vllm_supports_thinking():
     assert optional_params["reasoning_effort"] == "low"
 
 
-def test_hosted_vllm_thinking_blocks_prepended_to_assistant_content():
+def _transform_single_assistant_message(assistant_message: dict) -> dict:
+    return HostedVLLMChatConfig().transform_request(
+        model="hosted_vllm/llama-3.1-70b-instruct",
+        messages=[assistant_message],
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )["messages"][0]
+
+
+def test_hosted_vllm_thinking_blocks_become_reasoning_fields():
     """
-    Test that thinking_blocks on assistant messages are removed and content
-    stays a string for vLLM compatibility.
+    thinking_blocks are not a wire format vLLM understands, so they must be flattened into
+    the `reasoning` / `reasoning_content` fields instead of being dropped on the floor.
     """
     config = HostedVLLMChatConfig()
     messages = [
@@ -220,46 +230,136 @@ def test_hosted_vllm_thinking_blocks_prepended_to_assistant_content():
     )
     assistant_msg = transformed["messages"][1]
     assert assistant_msg["role"] == "assistant"
-    assert isinstance(assistant_msg["content"], str)
     assert assistant_msg["content"] == "Here is my answer."
+    assert assistant_msg["reasoning"] == "Let me reason about this..."
+    assert assistant_msg["reasoning_content"] == "Let me reason about this..."
     assert "thinking_blocks" not in assistant_msg
+    assert "signature" not in json.dumps(assistant_msg)
 
 
-def test_hosted_vllm_thinking_blocks_with_list_content():
-    """
-    Test thinking_blocks are removed and assistant content list is converted
-    to a string.
-    """
-    config = HostedVLLMChatConfig()
-    messages = [
+def test_hosted_vllm_multiple_thinking_blocks_are_joined_in_order():
+    assistant_msg = _transform_single_assistant_message(
         {
             "role": "assistant",
             "content": [{"type": "text", "text": "Response text"}],
             "thinking_blocks": [
-                {
-                    "type": "thinking",
-                    "thinking": "Step 1 reasoning",
-                    "signature": "sig1",
-                },
-                {
-                    "type": "thinking",
-                    "thinking": "Step 2 reasoning",
-                    "signature": "sig2",
-                },
+                {"type": "thinking", "thinking": "Step 1 reasoning", "signature": "sig1"},
+                {"type": "thinking", "thinking": "Step 2 reasoning", "signature": "sig2"},
+            ],
+        }
+    )
+    assert assistant_msg["content"] == "Response text"
+    assert assistant_msg["reasoning"] == "Step 1 reasoning\nStep 2 reasoning"
+    assert assistant_msg["reasoning_content"] == "Step 1 reasoning\nStep 2 reasoning"
+    assert "thinking_blocks" not in assistant_msg
+
+
+def test_hosted_vllm_redacted_thinking_blocks_are_skipped():
+    """
+    redacted_thinking carries opaque data with no text form; emitting it would send garbage
+    into the prompt, and its presence must not shadow the real thinking blocks either.
+    """
+    assistant_msg = _transform_single_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "thinking_blocks": [
+                {"type": "redacted_thinking", "data": "AAAABBBBCCCC"},
+                {"type": "thinking", "thinking": "visible reasoning"},
+            ],
+        }
+    )
+    assert assistant_msg["reasoning"] == "visible reasoning"
+    assert "AAAABBBBCCCC" not in json.dumps(assistant_msg)
+
+
+def test_hosted_vllm_only_redacted_thinking_sets_no_reasoning():
+    assistant_msg = _transform_single_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "thinking_blocks": [{"type": "redacted_thinking", "data": "AAAABBBBCCCC"}],
+        }
+    )
+    assert "reasoning" not in assistant_msg
+    assert "reasoning_content" not in assistant_msg
+    assert "thinking_blocks" not in assistant_msg
+
+
+def test_hosted_vllm_existing_reasoning_content_is_mirrored_into_reasoning():
+    """
+    vLLM 0.16 dropped the `reasoning_content` fallback, so a history that already carries
+    reasoning_content (the OpenAI-style round trip) still needs `reasoning` populated.
+    """
+    assistant_msg = _transform_single_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "reasoning_content": "reasoning from a previous turn",
+        }
+    )
+    assert assistant_msg["reasoning"] == "reasoning from a previous turn"
+    assert assistant_msg["reasoning_content"] == "reasoning from a previous turn"
+
+
+def test_hosted_vllm_existing_reasoning_content_wins_over_thinking_blocks():
+    assistant_msg = _transform_single_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "reasoning_content": "authoritative reasoning",
+            "thinking_blocks": [{"type": "thinking", "thinking": "stale reasoning"}],
+        }
+    )
+    assert assistant_msg["reasoning"] == "authoritative reasoning"
+    assert assistant_msg["reasoning_content"] == "authoritative reasoning"
+    assert "stale reasoning" not in json.dumps(assistant_msg)
+
+
+def test_hosted_vllm_assistant_without_reasoning_gains_no_reasoning_keys():
+    assistant_msg = _transform_single_assistant_message({"role": "assistant", "content": "Answer"})
+    assert "reasoning" not in assistant_msg
+    assert "reasoning_content" not in assistant_msg
+
+
+def test_hosted_vllm_anthropic_messages_bridge_preserves_thinking():
+    """
+    The path that actually loses reasoning in production: a /v1/messages request for a
+    hosted_vllm model has no native Anthropic config, so it is bridged to chat completions.
+    The bridge turns Anthropic thinking content into thinking_blocks; this asserts the
+    reasoning survives all the way into the vLLM request body.
+    """
+    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+        LiteLLMAnthropicMessagesAdapter,
+    )
+
+    anthropic_messages = [
+        {"role": "user", "content": "9.11 or 9.8, which is greater?"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Compare the decimals", "signature": "sig"},
+                {"type": "text", "text": "9.8 is greater."},
             ],
         },
+        {"role": "user", "content": "Why?"},
     ]
-    transformed = config.transform_request(
+    openai_messages = LiteLLMAnthropicMessagesAdapter().translate_anthropic_messages_to_openai(
+        messages=anthropic_messages
+    )
+
+    transformed = HostedVLLMChatConfig().transform_request(
         model="hosted_vllm/llama-3.1-70b-instruct",
-        messages=messages,
+        messages=openai_messages,
         optional_params={},
         litellm_params={},
         headers={},
     )
-    assistant_msg = transformed["messages"][0]
-    assert isinstance(assistant_msg["content"], str)
-    assert assistant_msg["content"] == "Response text"
-    assert "thinking_blocks" not in assistant_msg
+
+    assistant_msg = next(m for m in transformed["messages"] if m["role"] == "assistant")
+    assert assistant_msg["reasoning"] == "Compare the decimals"
+    assert assistant_msg["reasoning_content"] == "Compare the decimals"
+    assert assistant_msg["content"] == "9.8 is greater."
 
 
 def test_hosted_vllm_assistant_structured_content_is_preserved():

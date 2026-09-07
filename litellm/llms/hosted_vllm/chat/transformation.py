@@ -3,7 +3,7 @@ Translate from OpenAI's `/v1/chat/completions` to VLLM's `/v1/chat/completions`
 """
 
 import json
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Sequence
 from typing import (
     Any,
     Literal,
@@ -23,6 +23,8 @@ from litellm.types.llms.openai import (
     AllMessageValues,
     ChatCompletionAssistantToolCall,
     ChatCompletionFileObject,
+    ChatCompletionRedactedThinkingBlock,
+    ChatCompletionThinkingBlock,
     ChatCompletionToolCallFunctionChunk,
     ChatCompletionVideoObject,
     ChatCompletionVideoUrlObject,
@@ -30,6 +32,21 @@ from litellm.types.llms.openai import (
 
 from ....utils import _remove_additional_properties, _remove_strict_from_schema
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
+
+
+def _reasoning_text_from_thinking_blocks(
+    thinking_blocks: Sequence[ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock],
+) -> str | None:
+    """
+    Flatten Anthropic-style thinking blocks into the plain reasoning string vLLM accepts.
+
+    `redacted_thinking` blocks carry opaque data rather than text, so they have no
+    representation here and are skipped. Signatures are dropped too: vLLM never verifies them.
+    """
+    texts = tuple(
+        thinking for block in thinking_blocks if block["type"] == "thinking" and (thinking := block.get("thinking"))
+    )
+    return "\n".join(texts) if texts else None
 
 
 class HostedVLLMChatConfig(OpenAIGPTConfig):
@@ -169,12 +186,25 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
         """
         Support translating:
         - video files from file_id or file_data to video_url
-        - thinking_blocks on assistant messages are removed, and content lists
-          are converted to strings for vLLM compatibility
+        - thinking_blocks on assistant messages into the `reasoning` / `reasoning_content`
+          fields vLLM reads, and content lists are converted to strings for vLLM compatibility
+
+        vLLM reads reasoning off the message itself: `reasoning` since 0.12, with a
+        `reasoning_content` fallback that 0.16 dropped (see `_parse_chat_message_content` in
+        vllm/entrypoints/chat_utils.py). Both are written so one payload works across those
+        versions; older servers ignore the unknown keys. A `{"type": "thinking"}` content block
+        is accepted too, but vLLM flattens it into text merged with the answer, so it is unused
+        here.
         """
         for message in messages:
             if message["role"] == "assistant":
-                message.pop("thinking_blocks", None)
+                thinking_blocks = message.pop("thinking_blocks", None)
+                reasoning = message.get("reasoning_content") or _reasoning_text_from_thinking_blocks(
+                    thinking_blocks or ()
+                )
+                if reasoning:
+                    message["reasoning_content"] = reasoning
+                    message["reasoning"] = reasoning
                 existing_content = message.get("content")
                 if isinstance(existing_content, list):
                     text_parts = []

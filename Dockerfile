@@ -51,6 +51,7 @@ RUN apk add --no-cache \
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_LINK_MODE=copy \
+    UV_PYTHON_PREFERENCE=only-system \
     PATH="/app/.venv/bin:${PATH}"
 
 # Copy dependency metadata first for layer caching
